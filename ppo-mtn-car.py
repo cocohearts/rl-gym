@@ -9,6 +9,8 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 from gymnasium.vector import AsyncVectorEnv
+import cProfile
+import pstats
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -23,18 +25,19 @@ def make_env(env_name):
 
 
 class PolicyModel(nn.Module):
-    def __init__(self, input_dim=4):
+    def __init__(self, input_dim=2, output_dim=1):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 8),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(8, 4),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(4, 2),
             nn.ReLU(),
-            nn.Linear(32, 16),
+            nn.Linear(2, 1),
             nn.Tanh()
         ).to(device)
+        self.log_std = nn.Parameter(torch.ones(1, device=device) * -1)
 
     def forward(self, x):
         out = self.model(x)
@@ -42,14 +45,14 @@ class PolicyModel(nn.Module):
 
     def get_action(self, x):
         out = self(x)
-        action = torch.distributions.Normal(
-            out[:, :8], torch.exp(out[:, 8:])).sample()
+        eps = torch.randn_like(out)
+        action = out + eps * torch.exp(self.log_std)
         return action
 
     def get_probs(self, obs, action):
         out = self(obs)
         probs = torch.distributions.Normal(
-            out[:, :8], torch.exp(out[:, 8:])).log_prob(action)
+            out, torch.exp(self.log_std)).log_prob(action)
         return probs.prod(dim=-1)
 
 
@@ -57,17 +60,13 @@ class ValueModel(nn.Module):
     def __init__(self, input_dim=4):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 8),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(8, 4),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(4, 2),
             nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
+            nn.Linear(2, 1),
         ).to(device)
 
     def forward(self, x):
@@ -91,10 +90,10 @@ def discounted_returns(rewards, gamma):
 
     # Compute exponents for gamma^(j - i)
     exps = i_mat - j_mat
-    exps += torch.tensor(int(1e8), dtype=torch.long) * zero_mask
 
     # Construct the discount matrix G
     G = gamma ** exps
+    G[zero_mask] = 0
 
     # Compute the discounted returns R = G @ rewards
     return G.to(torch.float32) @ rewards.to(torch.float32)
@@ -136,7 +135,7 @@ class EpisodeDataset(Dataset):
 # %%
 
 class Agent:
-    def __init__(self, gamma=0.99, gae_lambda=0.95, epsilon=0.2, lr=0.0001, env_name="Ant-v5", num_envs=8):
+    def __init__(self, gamma=0.99, gae_lambda=0.95, epsilon=0.2, lr=0.0001, ent_coef=0.01, env_name="MountainCarContinuous-v0", num_envs=8):
         self.env_name = env_name
         self.num_envs = num_envs
         self.envs = AsyncVectorEnv([make_env(env_name)
@@ -154,6 +153,12 @@ class Agent:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.epsilon = epsilon
+        self.ent_coef = ent_coef
+
+    def shaped_reward(self, obs):
+        returned = torch.zeros(obs.shape[0], device=device)
+        returned[obs[:, 1, 0] < 0.45] = -1000000
+        return returned
 
     def update(self, policy_loss=None, value_loss=None):
         self.policy_optimizer.zero_grad()
@@ -186,8 +191,6 @@ class Agent:
             obs_output = torch.tensor(
                 observations, dtype=torch.float32).to(device)
 
-            dones = dones | (terminateds | truncateds)
-
             # Store transitions for each environment
             for env_idx in range(self.num_envs):
                 if not dones[env_idx]:
@@ -205,6 +208,8 @@ class Agent:
                         torch.tensor([rewards[env_idx]]).to(device)
                     ])
 
+            dones = dones | (terminateds | truncateds)
+
         return episode_obs, episode_acts, episode_rews
 
     def get_losses(self, states, actions, base_probs, base_advantages, real_rtg, epsilon=0.2):
@@ -217,6 +222,12 @@ class Agent:
         weighted_advantages = base_advantages * curr_probs/base_probs
         policy_loss = -torch.min(clipped_weighted_advantages,
                                  weighted_advantages).mean()
+
+        log_stds = self.policy_model.log_std
+        entropy = torch.distributions.Normal(
+            out, torch.exp(self.log_std)).entropy()
+        policy_loss -= self.ent_coef * entropy.mean()
+
         return policy_loss.mean(), value_loss
 
     def compute_statistics(self, all_episodes_obs, all_episodes_acts, all_episodes_rews):
@@ -235,8 +246,13 @@ class Agent:
 
             rtgs.append(discounted_returns(episode_rews, self.gamma).detach())
         base_probs = torch.cat(base_probs)
+        base_probs = base_probs.clip(1e-8, 1-1e-8)
         base_advantages = torch.cat(base_advantages)
         rtgs = torch.cat(rtgs)
+
+        rtgs = (rtgs - rtgs.mean()) / (rtgs.std() + 1e-8)
+        base_advantages = (base_advantages - base_advantages.mean()
+                           ) / (base_advantages.std() + 1e-8)
         return base_probs, base_advantages, rtgs
 
     def ppo_update(self, all_episodes_obs, all_episodes_acts, all_episodes_rews, steps=4, batch_size=32):
@@ -264,8 +280,8 @@ class Agent:
 
         return policy_loss, value_loss
 
-    def avg_reward(self, episodes):
-        return torch.tensor([episode[1][:, 1].sum() for episode in episodes]).mean()
+    def avg_reward(self, episodes_rews):
+        return torch.tensor([episode.sum() for episode in episodes_rews]).mean()
 
     def train(self, num_episodes=100, steps=4, print_loss=True):
         # Collect episodes from all environments
@@ -284,17 +300,20 @@ class Agent:
 
         all_episodes_obs = [episode[0] for episode in all_episodes]
         all_episodes_acts = [episode[1] for episode in all_episodes]
-        all_episodes_rews = [episode[2] for episode in all_episodes]
+        all_episodes_rews = [self.shaped_reward(
+            episode[0]) + episode[2] for episode in all_episodes]
+        all_episodes_true_rews = [episode[2] for episode in all_episodes]
 
         policy_loss, value_loss = self.ppo_update(
             all_episodes_obs, all_episodes_acts, all_episodes_rews, steps=steps)
-        total_reward = self.avg_reward(all_episodes).item()
+        total_reward = self.avg_reward(all_episodes_true_rews).item()
+        shaped_reward = self.avg_reward(all_episodes_rews).item()
 
         if print_loss:
             print(f"Policy loss: {policy_loss.item()}")
             print(f"Value loss: {value_loss.item()}")
             print(f"Average total reward: {total_reward}")
-
+            print(f"Average shaped reward: {shaped_reward}")
         return (policy_loss, value_loss, total_reward)
 
     def demo(self):
@@ -306,53 +325,61 @@ class Agent:
         truncated = False
         while not terminated and not truncated:
             action = self.policy_model.get_action(obs_output)
-            observation, reward, terminated, truncated, info = env.step(action.numpy()[
+            observation, reward, terminated, truncated, info = env.step(action.detach().cpu().numpy()[
                                                                         0])
             obs_output = torch.tensor(observation, dtype=torch.float32)[
                 None, :].to(device)
         env.close()
 
 
-# %%
-agent = Agent(num_envs=64, lr=0.0002)
-policy_losses = []
-value_losses = []
-total_rewards = []
-for i in tqdm(range(100), desc="Training"):
-    policy_loss, value_loss, total_reward = agent.train(
-        num_episodes=256, steps=8, print_loss=True)
-    policy_losses.append(policy_loss)
-    value_losses.append(value_loss)
-    total_rewards.append(total_reward)
+if __name__ == "__main__":
+    # %%
+    agent = Agent(num_envs=16, lr=0.001, ent_coef=1)
+    policy_losses = []
+    value_losses = []
+    total_rewards = []
 
-# agent.demo()
+    profiler = cProfile.Profile()
+    profiler.enable()
+    for i in tqdm(range(500), desc="Training"):
+        policy_loss, value_loss, total_reward = agent.train(
+            num_episodes=16, steps=8, print_loss=True)
+        policy_losses.append(policy_loss)
+        value_losses.append(value_loss)
+        total_rewards.append(total_reward)
 
-# %%
+    profiler.disable()
+    stats = pstats.Stats(profiler).sort_stats('cumulative')
+    stats.print_stats(30)  # Print top 30 time-consuming operations
 
-# Set the style
-sns.set_style("whitegrid")
-sns.set_context("notebook", font_scale=1.2)
+    agent.demo()
 
-# Create figure with 3 subplots
-fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+    # %%
 
-# Plot total rewards
-sns.lineplot(data=total_rewards, ax=ax1)
-ax1.set_title('Total Rewards over Time')
-ax1.set_xlabel('Training Iteration')
-ax1.set_ylabel('Average Total Reward')
+    # Set the style
+    sns.set_style("whitegrid")
+    sns.set_context("notebook", font_scale=1.2)
 
-# Plot policy losses
-sns.lineplot(data=[loss.item() for loss in policy_losses], ax=ax2)
-ax2.set_title('Policy Loss over Time')
-ax2.set_xlabel('Training Iteration')
-ax2.set_ylabel('Policy Loss')
+    # Create figure with 3 subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
 
-# Plot value losses
-sns.lineplot(data=[loss.item() for loss in value_losses], ax=ax3)
-ax3.set_title('Value Loss over Time')
-ax3.set_xlabel('Training Iteration')
-ax3.set_ylabel('Value Loss')
+    # Plot total rewards
+    sns.lineplot(data=total_rewards, ax=ax1)
+    ax1.set_title('Total Rewards over Time')
+    ax1.set_xlabel('Training Iteration')
+    ax1.set_ylabel('Average Total Reward')
 
-plt.tight_layout()
-plt.savefig('ppo-ant-loss.png')
+    # Plot policy losses
+    sns.lineplot(data=[loss.item() for loss in policy_losses], ax=ax2)
+    ax2.set_title('Policy Loss over Time')
+    ax2.set_xlabel('Training Iteration')
+    ax2.set_ylabel('Policy Loss')
+
+    # Plot value losses
+    sns.lineplot(data=[loss.item() for loss in value_losses], ax=ax3)
+    ax3.set_title('Value Loss over Time')
+    ax3.set_xlabel('Training Iteration')
+    ax3.set_ylabel('Value Loss')
+
+    plt.tight_layout()
+    plt.savefig('ppo-mtn-car-loss.png')
